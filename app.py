@@ -1,5 +1,4 @@
 import streamlit as st
-import sys
 import cv2
 import math
 import time
@@ -13,9 +12,7 @@ from collections import defaultdict, deque
 # STREAMLIT CONFIG
 # ===============================
 st.set_page_config(layout="wide")
-st.title("Traffic Near-Miss Detection (TTC + PET)")
-
-st.caption(f"Python version: {sys.version}")
+st.title("Traffic Near-Miss Detection (OpenCV + TTC + PET)")
 
 # ===============================
 # SIDEBAR CONTROLS
@@ -23,9 +20,7 @@ st.caption(f"Python version: {sys.version}")
 st.sidebar.header("Calibration & Thresholds")
 
 meters_per_pixel = st.sidebar.number_input(
-    "Meters per pixel",
-    min_value=0.001,
-    max_value=1.0,
+    "Meters per pixel (calibration)",
     value=20/600,
     step=0.001
 )
@@ -33,36 +28,38 @@ meters_per_pixel = st.sidebar.number_input(
 ttc_threshold = st.sidebar.slider("TTC threshold (s)", 0.5, 5.0, 2.0)
 pet_threshold = st.sidebar.slider("PET threshold (s)", 0.5, 5.0, 1.5)
 
-uploaded_video = st.file_uploader("Upload video", type=["mp4", "avi", "mov"])
-run_button = st.button("Run analysis")
+uploaded_video = st.file_uploader(
+    "Upload traffic video",
+    type=["mp4", "avi", "mov"]
+)
+
+run_button = st.button("Run Analysis")
 
 # ===============================
-# METRICS
+# HELPER FUNCTIONS
 # ===============================
-def velocity(p_prev, p_curr, dt, mpp):
+def velocity(p_prev, p_curr, dt):
     if dt == 0:
         return np.array([0.0, 0.0])
-    return (np.array(p_curr) - np.array(p_prev)) * mpp / dt
+    return (np.array(p_curr) - np.array(p_prev)) * meters_per_pixel / dt
 
-def time_to_collision(p1, v1, p2, v2, mpp):
-    dp = (np.array(p2) - np.array(p1)) * mpp
+def time_to_collision(p1, v1, p2, v2):
+    dp = (np.array(p2) - np.array(p1)) * meters_per_pixel
     dv = v2 - v1
-    dv2 = np.dot(dv, dv)
-    if dv2 < 1e-6:
+    denom = np.dot(dv, dv)
+    if denom < 1e-6:
         return np.inf
-    ttc = -np.dot(dp, dv) / dv2
+    ttc = -np.dot(dp, dv) / denom
     return ttc if ttc > 0 else np.inf
 
 def post_encroachment_time(path1, path2, fps):
-    if len(path1) < 2 or len(path2) < 2:
-        return np.inf
-    min_d = np.inf
+    min_dist = np.inf
     i_min = j_min = 0
     for i, p1 in enumerate(path1):
         for j, p2 in enumerate(path2):
             d = math.dist(p1, p2)
-            if d < min_d:
-                min_d = d
+            if d < min_dist:
+                min_dist = d
                 i_min, j_min = i, j
     return abs(i_min - j_min) / fps
 
@@ -97,7 +94,7 @@ def process_video(video_path):
         results = model.track(
             frame,
             persist=True,
-            classes=[2, 3, 5, 7]
+            classes=[2, 3, 5, 7]  # vehicles
         )
 
         ids = []
@@ -107,7 +104,8 @@ def process_video(video_path):
 
             for box, oid in zip(boxes, track_ids):
                 x1, y1, x2, y2 = map(int, box)
-                cx, cy = (x1+x2)//2, (y1+y2)//2
+                cx, cy = (x1 + x2)//2, (y1 + y2)//2
+
                 trajectories[oid].append((cx, cy))
                 ids.append(oid)
 
@@ -115,6 +113,12 @@ def process_video(video_path):
                 cv2.putText(frame, f"id:{int(oid)}",
                             (x1,y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+                for i in range(1, len(trajectories[oid])):
+                    cv2.line(frame,
+                             trajectories[oid][i-1],
+                             trajectories[oid][i],
+                             (0,255,0), 2)
 
         for i in range(len(ids)):
             for j in range(i+1, len(ids)):
@@ -125,24 +129,33 @@ def process_video(video_path):
                 p1n, p1p = trajectories[id1][-1], trajectories[id1][-2]
                 p2n, p2p = trajectories[id2][-1], trajectories[id2][-2]
 
-                v1 = velocity(p1p, p1n, 1/fps, meters_per_pixel)
-                v2 = velocity(p2p, p2n, 1/fps, meters_per_pixel)
+                v1 = velocity(p1p, p1n, 1/fps)
+                v2 = velocity(p2p, p2n, 1/fps)
 
-                ttc = time_to_collision(p1n, v1, p2n, v2, meters_per_pixel)
-                pet = post_encroachment_time(trajectories[id1], trajectories[id2], fps)
+                ttc = time_to_collision(p1n, v1, p2n, v2)
+                pet = post_encroachment_time(
+                    trajectories[id1],
+                    trajectories[id2],
+                    fps
+                )
 
                 if ttc < ttc_threshold or pet < pet_threshold:
                     events.append({
                         "ID": event_id,
+                        "Vehicle 1": int(id1),
+                        "Vehicle 2": int(id2),
                         "TTC (s)": round(ttc, 2),
                         "PET (s)": round(pet, 2),
-                        "Vehicle 1": "car",
-                        "Vehicle 2": "car",
                         "Time": time.strftime("%H:%M:%S")
                     })
                     event_id += 1
 
                     cv2.line(frame, p1n, p2n, (0,0,255), 2)
+                    cv2.putText(frame, "NEAR MISS",
+                                ((p1n[0]+p2n[0])//2,
+                                 (p1n[1]+p2n[1])//2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0,0,255), 2)
 
         out.write(frame)
 
@@ -152,17 +165,17 @@ def process_video(video_path):
     return out_path, pd.DataFrame(events)
 
 # ===============================
-# RUN
+# RUN PIPELINE
 # ===============================
 if uploaded_video and run_button:
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(uploaded_video.read())
-        path = tmp.name
+        video_path = tmp.name
 
     with st.spinner("Processing video…"):
-        out_video, df = process_video(path)
+        out_video, df = process_video(video_path)
 
-    st.success("Done")
+    st.success("Processing complete")
 
     st.video(out_video)
 
