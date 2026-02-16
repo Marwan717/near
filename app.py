@@ -1,187 +1,240 @@
-import streamlit as st
-import cv2
-import math
-import time
+import os
 import tempfile
+import math
+from collections import deque
+from itertools import combinations
+
+import streamlit as st
 import numpy as np
 import pandas as pd
+import cv2
 from ultralytics import YOLO
-from collections import defaultdict, deque
 
-# ===============================
-# STREAMLIT CONFIG
-# ===============================
+# =========================
+# CONFIG
+# =========================
+CAR_CLASS_ID = 2
+MATCH_DIST_PX = 60
+CLOSE_DIST_PX = 80
+MAX_TRACK_AGE = 20
+NEAR_MISS_TIME_S = 4.0
+
+# =========================
+# SPEED CALCULATION
+# =========================
+def compute_speed_mph(history, fps, meters_per_pixel):
+    if len(history) < 2:
+        return 0.0
+
+    f0, x0, y0 = history[-2]
+    f1, x1, y1 = history[-1]
+
+    dt = (f1 - f0) / fps
+    if dt <= 0:
+        return 0.0
+
+    dist_m = math.hypot(x1 - x0, y1 - y0) * meters_per_pixel
+    speed_mps = dist_m / dt
+    return speed_mps * 2.23694  # mph
+
+# =========================
+# SIMPLE TRACKER
+# =========================
+class SimpleTracker:
+    def __init__(self):
+        self.tracks = {}
+        self.next_id = 1
+
+    def update(self, detections, frame_idx):
+        updated = {}
+
+        for cx, cy, bbox in detections:
+            matched = None
+
+            for tid, tr in self.tracks.items():
+                dist = math.hypot(cx - tr["cx"], cy - tr["cy"])
+                if dist < MATCH_DIST_PX:
+                    matched = tid
+                    break
+
+            if matched is None:
+                matched = self.next_id
+                self.next_id += 1
+                updated[matched] = {
+                    "cx": cx,
+                    "cy": cy,
+                    "bbox": bbox,
+                    "last": frame_idx,
+                    "hist": deque(maxlen=20),
+                }
+            else:
+                tr = self.tracks[matched]
+                tr["cx"] = cx
+                tr["cy"] = cy
+                tr["bbox"] = bbox
+                tr["last"] = frame_idx
+                updated[matched] = tr
+
+            updated[matched]["hist"].append((frame_idx, cx, cy))
+
+        self.tracks = {
+            tid: tr for tid, tr in updated.items()
+            if frame_idx - tr["last"] <= MAX_TRACK_AGE
+        }
+
+        return self.tracks
+
+# =========================
+# STREAMLIT UI
+# =========================
 st.set_page_config(layout="wide")
-st.title("Traffic Near-Miss Detection (OpenCV + TTC + PET)")
+st.title("Traffic Near Miss Detection")
 
-# ===============================
-# SIDEBAR CONTROLS
-# ===============================
-st.sidebar.header("Calibration & Thresholds")
+uploaded = st.file_uploader("Upload traffic video", type=["mp4", "avi", "mov"])
 
-meters_per_pixel = st.sidebar.number_input(
-    "Meters per pixel (calibration)",
-    value=20/600,
-    step=0.001
+st.subheader("Calibration")
+meters_per_pixel = st.number_input(
+    "Meters per pixel (estimate using lane width)",
+    value=0.05,
+    step=0.01
 )
 
-ttc_threshold = st.sidebar.slider("TTC threshold (s)", 0.5, 5.0, 2.0)
-pet_threshold = st.sidebar.slider("PET threshold (s)", 0.5, 5.0, 1.5)
+run = st.button("Run Analysis", type="primary")
 
-uploaded_video = st.file_uploader(
-    "Upload traffic video",
-    type=["mp4", "avi", "mov"]
-)
+# =========================
+# MAIN LOGIC
+# =========================
+if run and uploaded:
 
-run_button = st.button("Run Analysis")
+    with st.spinner("Processing video..."):
 
-# ===============================
-# HELPER FUNCTIONS
-# ===============================
-def velocity(p_prev, p_curr, dt):
-    if dt == 0:
-        return np.array([0.0, 0.0])
-    return (np.array(p_curr) - np.array(p_prev)) * meters_per_pixel / dt
+        tmp_dir = tempfile.mkdtemp()
+        video_path = os.path.join(tmp_dir, uploaded.name)
 
-def time_to_collision(p1, v1, p2, v2):
-    dp = (np.array(p2) - np.array(p1)) * meters_per_pixel
-    dv = v2 - v1
-    denom = np.dot(dv, dv)
-    if denom < 1e-6:
-        return np.inf
-    ttc = -np.dot(dp, dv) / denom
-    return ttc if ttc > 0 else np.inf
+        with open(video_path, "wb") as f:
+            f.write(uploaded.getbuffer())
 
-def post_encroachment_time(path1, path2, fps):
-    min_dist = np.inf
-    i_min = j_min = 0
-    for i, p1 in enumerate(path1):
-        for j, p2 in enumerate(path2):
-            d = math.dist(p1, p2)
-            if d < min_dist:
-                min_dist = d
-                i_min, j_min = i, j
-    return abs(i_min - j_min) / fps
+        cap = cv2.VideoCapture(video_path)
 
-# ===============================
-# VIDEO PROCESSING
-# ===============================
-def process_video(video_path):
-    model = YOLO("yolov8n.pt")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out_path = "output.mp4"
-    out = cv2.VideoWriter(
-        out_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (w, h)
-    )
-
-    trajectories = defaultdict(lambda: deque(maxlen=30))
-    events = []
-    event_id = 1
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        results = model.track(
-            frame,
-            persist=True,
-            classes=[2, 3, 5, 7]  # vehicles
+        out_path = os.path.join(tmp_dir, "output.mp4")
+        writer = cv2.VideoWriter(
+            out_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height)
         )
 
-        ids = []
-        if results and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            track_ids = results[0].boxes.id.cpu().numpy()
+        model = YOLO("yolov8n.pt")
+        tracker = SimpleTracker()
 
-            for box, oid in zip(boxes, track_ids):
-                x1, y1, x2, y2 = map(int, box)
-                cx, cy = (x1 + x2)//2, (y1 + y2)//2
+        progress = st.progress(0)
+        preview = st.empty()
+        popup = st.empty()
 
-                trajectories[oid].append((cx, cy))
-                ids.append(oid)
+        events = []
+        frame_idx = 0
 
-                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,0,255), 2)
-                cv2.putText(frame, f"id:{int(oid)}",
-                            (x1,y1-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-                for i in range(1, len(trajectories[oid])):
-                    cv2.line(frame,
-                             trajectories[oid][i-1],
-                             trajectories[oid][i],
-                             (0,255,0), 2)
+            results = model.predict(frame, conf=0.3, verbose=False)[0]
 
-        for i in range(len(ids)):
-            for j in range(i+1, len(ids)):
-                id1, id2 = ids[i], ids[j]
-                if len(trajectories[id1]) < 2 or len(trajectories[id2]) < 2:
-                    continue
+            detections = []
+            if results.boxes is not None:
+                for box, cls in zip(
+                    results.boxes.xyxy.cpu().numpy(),
+                    results.boxes.cls.cpu().numpy().astype(int)
+                ):
+                    if cls == CAR_CLASS_ID:
+                        x1, y1, x2, y2 = box
+                        cx = (x1 + x2) / 2
+                        cy = (y1 + y2) / 2
+                        detections.append((cx, cy, box))
 
-                p1n, p1p = trajectories[id1][-1], trajectories[id1][-2]
-                p2n, p2p = trajectories[id2][-1], trajectories[id2][-2]
+            tracks = tracker.update(detections, frame_idx)
 
-                v1 = velocity(p1p, p1n, 1/fps)
-                v2 = velocity(p2p, p2n, 1/fps)
+            danger_ids = set()
+            popup_lines = []
 
-                ttc = time_to_collision(p1n, v1, p2n, v2)
-                pet = post_encroachment_time(
-                    trajectories[id1],
-                    trajectories[id2],
-                    fps
+            track_list = list(tracks.items())
+
+            for (id1, t1), (id2, t2) in combinations(track_list, 2):
+
+                dist = math.hypot(t1["cx"] - t2["cx"], t1["cy"] - t2["cy"])
+
+                if dist < CLOSE_DIST_PX:
+
+                    danger_ids.update([id1, id2])
+
+                    v1 = compute_speed_mph(t1["hist"], fps, meters_per_pixel)
+                    v2 = compute_speed_mph(t2["hist"], fps, meters_per_pixel)
+
+                    event_time = round(frame_idx / fps, 2)
+
+                    popup_lines.append(
+                        f"Cars {id1} & {id2} | Avg Speed {round((v1+v2)/2,1)} mph | Time {event_time}s"
+                    )
+
+                    events.append({
+                        "time_s": event_time,
+                        "car_1": id1,
+                        "car_2": id2,
+                        "avg_speed_mph": round((v1+v2)/2,2)
+                    })
+
+            popup.info("\n".join(popup_lines) if popup_lines else "No active conflict")
+
+            for tid, tr in tracks.items():
+                x1, y1, x2, y2 = map(int, tr["bbox"])
+                color = (0, 0, 255) if tid in danger_ids else (0, 255, 0)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    f"ID {tid}",
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
                 )
 
-                if ttc < ttc_threshold or pet < pet_threshold:
-                    events.append({
-                        "ID": event_id,
-                        "Vehicle 1": int(id1),
-                        "Vehicle 2": int(id2),
-                        "TTC (s)": round(ttc, 2),
-                        "PET (s)": round(pet, 2),
-                        "Time": time.strftime("%H:%M:%S")
-                    })
-                    event_id += 1
+            if frame_idx % 5 == 0:
+                preview.image(frame, channels="BGR", use_container_width=True)
 
-                    cv2.line(frame, p1n, p2n, (0,0,255), 2)
-                    cv2.putText(frame, "NEAR MISS",
-                                ((p1n[0]+p2n[0])//2,
-                                 (p1n[1]+p2n[1])//2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (0,0,255), 2)
+            writer.write(frame)
 
-        out.write(frame)
+            progress.progress(min(frame_idx / total_frames, 1.0))
+            frame_idx += 1
 
-    cap.release()
-    out.release()
+        cap.release()
+        writer.release()
 
-    return out_path, pd.DataFrame(events)
+    df = pd.DataFrame(events)
 
-# ===============================
-# RUN PIPELINE
-# ===============================
-if uploaded_video and run_button:
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(uploaded_video.read())
-        video_path = tmp.name
+    st.subheader("Analysis Summary")
 
-    with st.spinner("Processing video…"):
-        out_video, df = process_video(video_path)
-
-    st.success("Processing complete")
-
-    st.video(out_video)
-
-    st.subheader("Near-Miss Events")
-    if len(df):
-        st.dataframe(df, use_container_width=True)
-        st.metric("Total Near Misses", len(df))
+    if df.empty:
+        st.write("No near-miss events detected.")
     else:
-        st.info("No near-miss events detected.")
+        st.write(f"Total Near Miss Events: {len(df)}")
+        st.write(f"Average Speed During Events: {round(df['avg_speed_mph'].mean(),2)} mph")
+
+    st.subheader("Event Table")
+    st.dataframe(df, use_container_width=True)
+
+    csv_path = os.path.join(tmp_dir, "events.csv")
+    df.to_csv(csv_path, index=False)
+
+    st.video(out_path)
+    st.download_button("Download CSV", open(csv_path, "rb"), "events.csv")
